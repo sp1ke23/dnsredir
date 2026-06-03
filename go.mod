@@ -39,7 +39,7 @@ require (
 	github.com/prometheus/exporter-toolkit v0.16.0 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.59.0 // indirect
+	github.com/quic-go/quic-go v0.59.1 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/ti-mo/netfilter v0.4.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.43.0 // indirect
