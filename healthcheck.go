@@ -39,6 +39,7 @@ type Transport struct {
 	recursionDesired bool          // RD flag
 	expire           time.Duration // [sic] After this duration a connection is expired
 	tlsConfig        *tls.Config
+	proxy            *socks5Dialer
 
 	conns [typeTotalCount][]*persistConn // Buckets for udp, tcp and tcp-tls
 	dial  chan string
@@ -226,12 +227,18 @@ func (uh *UpstreamHost) InitDOH(u *reloadableUpstream) {
 		TLSHandshakeTimeout:   8 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	dialContext := dialer.DialContext
+	if u.proxy != nil {
+		httpTransport.Proxy = nil
+		dialContext = u.proxy.DialContext
+	}
+	httpTransport.DialContext = dialContext
 	if u.noIPv6 {
 		httpTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if strings.HasPrefix(network, "tcp") {
 				network = "tcp4"
 			}
-			return dialer.DialContext(ctx, network, addr)
+			return dialContext(ctx, network, addr)
 		}
 	}
 
@@ -284,7 +291,11 @@ func (t *Transport) updateDialTimeout(newDialTime time.Duration) {
 	atomic.AddInt64(&t.avgDialTime, dt/cumulativeAvgWeight)
 }
 
-func dialTimeout0(network, address string, tlsConfig *tls.Config, timeout time.Duration, bootstrap []string, noIPv6 bool) (*dns.Conn, error) {
+func dialTimeout0(network, address string, tlsConfig *tls.Config, timeout time.Duration, bootstrap []string, noIPv6 bool, pd *socks5Dialer) (*dns.Conn, error) {
+	if pd != nil {
+		return dialProxyConn(network, address, tlsConfig, timeout, pd)
+	}
+
 	var resolver *net.Resolver
 
 	if len(bootstrap) != 0 {
@@ -319,20 +330,21 @@ func dialTimeout0(network, address string, tlsConfig *tls.Config, timeout time.D
 
 // [sic] DialTimeoutWithTLS acts like DialWithTLS but takes a timeout.
 // Taken from dns.DialTimeoutWithTLS() with modification
-func dialTimeoutWithTLS(network, address string, tlsConfig *tls.Config, timeout time.Duration, bootstrap []string, noIPv6 bool) (*dns.Conn, error) {
+func dialTimeoutWithTLS(network, address string, tlsConfig *tls.Config, timeout time.Duration, bootstrap []string, noIPv6 bool, pd *socks5Dialer) (*dns.Conn, error) {
 	if !strings.HasSuffix(network, "-tls") {
 		network += "-tls"
 	}
-	return dialTimeout0(network, address, tlsConfig, timeout, bootstrap, noIPv6)
+	return dialTimeout0(network, address, tlsConfig, timeout, bootstrap, noIPv6, pd)
 }
 
 // [sic] DialTimeout acts like Dial but takes a timeout.
 // Taken from dns.DialTimeout() with modification
-func dialTimeout(network, address string, timeout time.Duration, bootstrap []string, noIPv6 bool) (*dns.Conn, error) {
-	return dialTimeout0(network, address, nil, timeout, bootstrap, noIPv6)
+func dialTimeout(network, address string, timeout time.Duration, bootstrap []string, noIPv6 bool, pd *socks5Dialer) (*dns.Conn, error) {
+	return dialTimeout0(network, address, nil, timeout, bootstrap, noIPv6, pd)
 }
 
 // Return:
+//
 //	#0	Persistent connection
 //	#1	true if it's a cached connection
 //	#2	error(if any)
@@ -350,14 +362,14 @@ func (uh *UpstreamHost) Dial(proto string, bootstrap []string, noIPv6 bool) (*pe
 	reqTime := time.Now()
 	timeout := uh.transport.dialTimeout()
 	if proto == "tcp-tls" {
-		conn, err := dialTimeoutWithTLS(proto, uh.addr, uh.transport.tlsConfig, timeout, bootstrap, noIPv6)
+		conn, err := dialTimeoutWithTLS(proto, uh.addr, uh.transport.tlsConfig, timeout, bootstrap, noIPv6, uh.transport.proxy)
 		uh.transport.updateDialTimeout(time.Since(reqTime))
 		if err != nil {
 			return nil, false, err
 		}
 		return &persistConn{c: conn}, false, err
 	}
-	conn, err := dialTimeout(proto, uh.addr, timeout, bootstrap, noIPv6)
+	conn, err := dialTimeout(proto, uh.addr, timeout, bootstrap, noIPv6, uh.transport.proxy)
 	uh.transport.updateDialTimeout(time.Since(reqTime))
 	if err != nil {
 		return nil, false, err
@@ -470,7 +482,8 @@ func (uh *UpstreamHost) Exchange(ctx context.Context, state *request.Request, bo
 
 // For health check we send to . IN NS +norec message to the upstream.
 // Dial timeouts and empty replies are considered fails
-// 	basically anything else constitutes a healthy upstream.
+//
+//	basically anything else constitutes a healthy upstream.
 func (uh *UpstreamHost) Check() error {
 	if err, rtt := uh.send(); err != nil {
 		HealthCheckFailureCount.WithLabelValues(uh.Name()).Inc()
@@ -513,10 +526,21 @@ func (uh *UpstreamHost) udpWireFormatSend() (error, time.Duration) {
 	req.SetQuestion(".", dns.TypeNS)
 	req.MsgHdr.RecursionDesired = uh.transport.recursionDesired
 	t := time.Now()
-	// rtt stands for Round Trip Time, it may 0 if Exchange() failed
-	msg, rtt, err := uh.c.Exchange(req, uh.addr)
-	if err != nil && rtt == 0 {
+
+	var (
+		msg *dns.Msg
+		rtt time.Duration
+		err error
+	)
+	if uh.transport.proxy != nil {
+		msg, err = uh.proxyExchange(req)
 		rtt = time.Since(t)
+	} else {
+		// rtt stands for Round Trip Time, it may 0 if Exchange() failed
+		msg, rtt, err = uh.c.Exchange(req, uh.addr)
+		if err != nil && rtt == 0 {
+			rtt = time.Since(t)
+		}
 	}
 	// If we got a header, we're alright, basically only care about I/O errors 'n stuff.
 	if err != nil && msg != nil {
@@ -529,12 +553,34 @@ func (uh *UpstreamHost) udpWireFormatSend() (error, time.Duration) {
 	return err, rtt
 }
 
+// proxyExchange sends a health check query over a fresh connection dialed
+// through the configured SOCKS5 proxy.
+func (uh *UpstreamHost) proxyExchange(req *dns.Msg) (*dns.Msg, error) {
+	network := protoToNetwork(uh.proto)
+	if network == "dns" {
+		network = "udp"
+	}
+	conn, err := dialProxyConn(network, uh.addr, uh.transport.tlsConfig, uh.transport.dialTimeout(), uh.transport.proxy)
+	if err != nil {
+		return nil, err
+	}
+	defer Close(conn)
+
+	_ = conn.SetWriteDeadline(time.Now().Add(maxWriteTimeout))
+	if err := conn.WriteMsg(req); err != nil {
+		return nil, err
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(maxReadTimeout))
+	return conn.ReadMsg()
+}
+
 // UpstreamHostPool is an array of upstream DNS servers
 type UpstreamHostPool []*UpstreamHost
 
 // Down checks whether the upstream host is down or not
 // Down will try to use uh.downFunc first, and will fallback
-// 	to some default criteria if necessary.
+//
+//	to some default criteria if necessary.
 func (uh *UpstreamHost) Down() bool {
 	if uh.downFunc == nil {
 		log.Warningf("Upstream host %v have no downFunc, fallback to default", uh.Name())

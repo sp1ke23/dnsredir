@@ -35,6 +35,7 @@ type reloadableUpstream struct {
 	pf        interface{}
 	noIPv6    bool
 	maxRetry  int32
+	proxy     *socks5Dialer
 }
 
 // reloadableUpstream implements Upstream interface
@@ -158,6 +159,7 @@ func newReloadableUpstream(c *caddy.Controller) (Upstream, error) {
 		host.addr = addr
 
 		host.transport = newTransport()
+		host.transport.proxy = u.proxy
 		// Inherit from global transport settings
 		host.transport.recursionDesired = u.transport.recursionDesired
 		host.transport.expire = u.transport.expire
@@ -433,6 +435,17 @@ func parseBlock(c *caddy.Controller, u *reloadableUpstream) error {
 		if err := parseBootstrap(c, u); err != nil {
 			return err
 		}
+	case "proxy":
+		args := c.RemainingArgs()
+		if len(args) != 1 {
+			return c.ArgErr()
+		}
+		pd, err := newSocks5Dialer(args[0])
+		if err != nil {
+			return c.Errf("invalid proxy %q: %v", args[0], err)
+		}
+		u.proxy = pd
+		log.Infof("%v: %v", dir, pd)
 	case "ipset":
 		if err := ipsetParse(c, u); err != nil {
 			return err

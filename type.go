@@ -32,7 +32,7 @@ func stringToTransportType(s string) transportType {
 }
 
 func (t *Transport) transportTypeFromConn(pc *persistConn) transportType {
-	if _, ok := pc.c.Conn.(*net.UDPConn); ok {
+	if _, ok := pc.c.Conn.(net.PacketConn); ok {
 		return typeUdp
 	}
 
