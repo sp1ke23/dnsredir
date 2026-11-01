@@ -85,6 +85,9 @@ func (r *Dnsredir) ServeDNS(ctx context.Context, w dns.ResponseWriter, req *dns.
 		host := upstream.Select()
 		if host == nil || tryCount > upstream.maxRetry {
 			log.Debug(errNoHealthy)
+			if upstream.serveFallback(ctx, w, state, server) {
+				return dns.RcodeSuccess, nil
+			}
 			return dns.RcodeServerFailure, errNoHealthy
 		}
 		log.Debugf("Upstream host %v is selected", host.Name())
@@ -119,6 +122,10 @@ func (r *Dnsredir) ServeDNS(ctx context.Context, w dns.ResponseWriter, req *dns.
 			return dns.RcodeSuccess, nil
 		}
 
+		if reply.Rcode == dns.RcodeServerFailure && upstream.serveFallback(ctx, w, state, server) {
+			return dns.RcodeSuccess, nil
+		}
+
 		// Add resolved IPs to ipset/pf before write response to DNS resolver
 		// 	thus the rule based routing can take effect immediately
 		ipsetAddIP(upstream, reply)
@@ -136,10 +143,47 @@ func (r *Dnsredir) ServeDNS(ctx context.Context, w dns.ResponseWriter, req *dns.
 		return dns.RcodeSuccess, nil
 	}
 
+	if upstream.serveFallback(ctx, w, state, server) {
+		return dns.RcodeSuccess, nil
+	}
 	if upstreamErr == nil {
-		panic("Why upstreamErr is nil?! Are you in a debugger or your machine running slow?")
+		upstreamErr = errNoHealthy
 	}
 	return dns.RcodeServerFailure, upstreamErr
+}
+
+// serveFallback sends the request to the fallback upstreams when every regular
+// upstream failed. Fallbacks always dial directly, so a dead proxy does not
+// take them down, and DNS keeps working (possibly with polluted answers)
+// instead of failing closed.
+func (u *reloadableUpstream) serveFallback(ctx context.Context, w dns.ResponseWriter, state *request.Request, server string) bool {
+	for _, host := range u.fallbackHosts {
+		start := time.Now()
+		reply, err := host.Exchange(ctx, state, u.bootstrap, u.noIPv6)
+		if err != nil {
+			log.Warningf("fallback %v failed: %v", host.Name(), err)
+			continue
+		}
+		if !state.Match(reply) {
+			log.Warningf("fallback %v returned a mismatched reply", host.Name())
+			continue
+		}
+		ipsetAddIP(u, reply)
+		pfAddIP(u, reply)
+		if err := w.WriteMsg(reply); err != nil {
+			log.Warningf("fallback %v: write failed: %v", host.Name(), err)
+			continue
+		}
+		RequestDuration.WithLabelValues(server, host.Name()).Observe(float64(time.Since(start).Milliseconds()))
+		RequestCount.WithLabelValues(server, host.Name()).Inc()
+		rc, ok := dns.RcodeToString[reply.Rcode]
+		if !ok {
+			rc = strconv.Itoa(reply.Rcode)
+		}
+		RcodeCount.WithLabelValues(server, host.Name(), rc).Inc()
+		return true
+	}
+	return false
 }
 
 func healthCheck(r *reloadableUpstream, uh *UpstreamHost) {

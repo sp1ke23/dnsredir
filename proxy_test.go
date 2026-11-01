@@ -1,10 +1,14 @@
 package dnsredir
 
 import (
+	"context"
 	"io"
 	"net"
 	"testing"
 	"time"
+
+	"github.com/coredns/coredns/request"
+	"github.com/miekg/dns"
 )
 
 func TestNewSocks5Dialer(t *testing.T) {
@@ -193,5 +197,60 @@ func TestDialProxyUDPConn(t *testing.T) {
 	}
 	if string(buf) != "ping" {
 		t.Fatalf("got %q, want %q", buf, "ping")
+	}
+}
+
+type fakeWriter struct {
+	msg *dns.Msg
+}
+
+func (f *fakeWriter) WriteMsg(m *dns.Msg) error   { f.msg = m; return nil }
+func (f *fakeWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (f *fakeWriter) Close() error                { return nil }
+func (f *fakeWriter) TsigStatus() error           { return nil }
+func (f *fakeWriter) TsigTimersOnly(bool)         {}
+func (f *fakeWriter) Hijack()                     {}
+func (f *fakeWriter) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 53}
+}
+func (f *fakeWriter) RemoteAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5353}
+}
+
+func TestServeFallback(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		rr, err := dns.NewRR(r.Question[0].Name + " 60 IN A 192.0.2.1")
+		if err == nil {
+			m.Answer = append(m.Answer, rr)
+		}
+		_ = w.WriteMsg(m)
+	})}
+	go func() { _ = srv.ActivateAndServe() }()
+	defer srv.Shutdown()
+
+	u := &reloadableUpstream{HealthCheck: &HealthCheck{transport: newTransport()}}
+	host, err := newFallbackHost(u, "udp://"+pc.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	host.transport.Start()
+	defer host.transport.Stop()
+	u.fallbackHosts = []*UpstreamHost{host}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	w := &fakeWriter{}
+	state := &request.Request{W: w, Req: req}
+	if !u.serveFallback(context.Background(), w, state, "test") {
+		t.Fatal("serveFallback returned false")
+	}
+	if w.msg == nil || len(w.msg.Answer) != 1 {
+		t.Fatalf("unexpected reply: %v", w.msg)
 	}
 }
