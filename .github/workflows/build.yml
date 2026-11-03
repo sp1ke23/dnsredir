@@ -47,18 +47,17 @@ jobs:
           uname -v
 
           DNSREDIR_DIR=$PWD
-          REPO_ADDR=$(git remote get-url origin | sed -e 's/^https:\/\///' -e 's/\.git//')
+          # The repository may be renamed, or a PR may be built from a fork,
+          # so the git remote is not a reliable module path.  Use the module
+          # path declared in go.mod: it must match what CoreDNS imports.
+          REPO_ADDR=$(head -n 1 go.mod | awk '{print $2}')
           HEAD_COMMIT=$(git describe --dirty --always)
-          DNSREDIR_TAG=$(curl -sL https://api.github.com/repos/leiless/dnsredir/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
+          DNSREDIR_TAG=$(curl -sL https://api.github.com/repos/${REPO_ADDR#github.com/}/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
 
           COREDNS_URL=https://github.com/coredns/coredns.git
           COREDNS_DIR=coredns
           COREDNS_TAG=$(curl -sL https://api.github.com/repos/coredns/coredns/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
           git clone --branch $COREDNS_TAG --depth 1 $COREDNS_URL $COREDNS_DIR 2> /dev/null
-
-          mkdir -p ~/go/pkg/mod/github.com/leiless
-          # Link leiless/dnsredir to latest master tree.
-          ln -s $DNSREDIR_DIR ~/go/pkg/mod/github.com/leiless/dnsredir@$DNSREDIR_TAG
 
           pushd $COREDNS_DIR
           sed -i "s|forward:forward|dnsredir:$REPO_ADDR\nforward:forward|g" plugin.cfg
@@ -67,7 +66,10 @@ jobs:
           go generate coredns.go
           git diff
           git status
-          go get
+          # Build the checked-out tree, not the latest release: the
+          # module cache symlink silently fell back to the release.
+          go mod edit -replace $REPO_ADDR=$DNSREDIR_DIR
+          go get $REPO_ADDR
           popd
 
       - name: Debug build ${{ env.GOOS }}-${{ env.GOARCH }}
@@ -84,7 +86,7 @@ jobs:
           # Temporary fix to the 'missing go.sum entry for module providing package ...' bug
           # see: https://github.com/golang/go/issues/44129#issuecomment-806400315
           make CGO_ENABLED=1 BUILDOPTS="-mod=mod -race" -j$(nproc)
-          ./coredns -plugins | grep -q dns.dnsredir$
+          ./coredns -plugins | grep -Eq '^(dns\.)?dnsredir$'
           popd
 
       - name: Debug build for release ${{ env.GOOS }}-${{ env.GOARCH }}
@@ -211,23 +213,22 @@ jobs:
           GH_API_CRED=$GITHUB_ACTOR:$BYPASS_GH_API_RATE_LIMIT
 
           DNSREDIR_DIR=$PWD
-          REPO_ADDR=$(git remote get-url origin | sed -e 's/^https:\/\///' -e 's/\.git//')
+          # The repository may be renamed, or a PR may be built from a fork,
+          # so the git remote is not a reliable module path.  Use the module
+          # path declared in go.mod: it must match what CoreDNS imports.
+          REPO_ADDR=$(head -n 1 go.mod | awk '{print $2}')
           HEAD_COMMIT=$(git describe --dirty --always)
           # GH#18: Fix macOS GitHub API access rate limit
-          DNSREDIR_TAG=$(curl -sL -u $GH_API_CRED https://api.github.com/repos/leiless/dnsredir/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
+          DNSREDIR_TAG=$(curl -sL -u $GH_API_CRED https://api.github.com/repos/${REPO_ADDR#github.com/}/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
 
           pushd pf
-          ./download-pf-headers.sh
+          sudo ./download-pf-headers.sh
           popd
 
           COREDNS_URL=https://github.com/coredns/coredns.git
           COREDNS_DIR=coredns
           COREDNS_TAG=$(curl -sL -u $GH_API_CRED https://api.github.com/repos/coredns/coredns/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
           git clone --branch $COREDNS_TAG --depth 1 $COREDNS_URL $COREDNS_DIR 2> /dev/null
-
-          mkdir -p ~/go/pkg/mod/github.com/leiless
-          # Link leiless/dnsredir to latest master tree.
-          ln -s $DNSREDIR_DIR ~/go/pkg/mod/github.com/leiless/dnsredir@$DNSREDIR_TAG
 
           # BSD sed sucks!
           brew install gnu-sed
@@ -239,7 +240,10 @@ jobs:
           go generate coredns.go
           git diff
           git status
-          go get
+          # Build the checked-out tree, not the latest release: the
+          # module cache symlink silently fell back to the release.
+          go mod edit -replace $REPO_ADDR=$DNSREDIR_DIR
+          go get $REPO_ADDR
           popd
 
       - name: Debug build ${{ env.GOOS }}-${{ env.GOARCH }}
@@ -253,7 +257,7 @@ jobs:
           COREDNS_DIR=coredns
           pushd $COREDNS_DIR
           make CGO_ENABLED=1 BUILDOPTS="-race" -j$(sysctl -n hw.ncpu)
-          ./coredns -plugins | grep -q dns.dnsredir$
+          ./coredns -plugins | grep -Eq '^(dns\.)?dnsredir$'
           popd
 
       - name: Debug build for release ${{ env.GOOS }}-${{ env.GOARCH }}
