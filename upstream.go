@@ -35,6 +35,10 @@ type reloadableUpstream struct {
 	pf        interface{}
 	noIPv6    bool
 	maxRetry  int32
+	proxy     *socks5Dialer
+
+	fallbacks     []string
+	fallbackHosts []*UpstreamHost
 }
 
 // reloadableUpstream implements Upstream interface
@@ -68,6 +72,9 @@ func (u *reloadableUpstream) Match(name string) bool {
 func (u *reloadableUpstream) Start() error {
 	u.periodicUpdate(u.bootstrap)
 	u.HealthCheck.Start()
+	for _, host := range u.fallbackHosts {
+		host.transport.Start()
+	}
 	if err := ipsetSetup(u); err != nil {
 		return err
 	}
@@ -81,6 +88,9 @@ func (u *reloadableUpstream) Stop() error {
 	close(u.stopPathReload)
 	close(u.stopUrlReload)
 	u.HealthCheck.Stop()
+	for _, host := range u.fallbackHosts {
+		host.transport.Stop()
+	}
 	if err := ipsetShutdown(u); err != nil {
 		return err
 	}
@@ -158,6 +168,7 @@ func newReloadableUpstream(c *caddy.Controller) (Upstream, error) {
 		host.addr = addr
 
 		host.transport = newTransport()
+		host.transport.proxy = u.proxy
 		// Inherit from global transport settings
 		host.transport.recursionDesired = u.transport.recursionDesired
 		host.transport.expire = u.transport.expire
@@ -193,6 +204,15 @@ func newReloadableUpstream(c *caddy.Controller) (Upstream, error) {
 			Timeout:   defaultHcTimeout,
 		}
 		host.InitDOH(u)
+	}
+
+	for _, spec := range u.fallbacks {
+		host, err := newFallbackHost(u, spec)
+		if err != nil {
+			return nil, err
+		}
+		u.fallbackHosts = append(u.fallbackHosts, host)
+		log.Infof("Fallback: %v", host)
 	}
 
 	if err := u.inline.ForEachDomain(func(name string) error {
@@ -429,10 +449,32 @@ func parseBlock(c *caddy.Controller, u *reloadableUpstream) error {
 		}
 		u.transport.tlsConfig.ServerName = serverName
 		log.Infof("%v: %v", dir, serverName)
+	case "fallback":
+		args := c.RemainingArgs()
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		specs, err := HostPort(args)
+		if err != nil {
+			return err
+		}
+		u.fallbacks = append(u.fallbacks, specs...)
+		log.Infof("%v: %v", dir, specs)
 	case "bootstrap":
 		if err := parseBootstrap(c, u); err != nil {
 			return err
 		}
+	case "proxy":
+		args := c.RemainingArgs()
+		if len(args) != 1 {
+			return c.ArgErr()
+		}
+		pd, err := newSocks5Dialer(args[0])
+		if err != nil {
+			return c.Errf("invalid proxy %q: %v", args[0], err)
+		}
+		u.proxy = pd
+		log.Infof("%v: %v", dir, pd)
 	case "ipset":
 		if err := ipsetParse(c, u); err != nil {
 			return err
@@ -612,3 +654,44 @@ const (
 	minHcInterval     = 1 * time.Second
 	minExpireInterval = 1 * time.Second
 )
+
+// newFallbackHost builds a fallback upstream. Fallback hosts always dial
+// directly: the proxy option must not apply to them, otherwise a dead proxy
+// would also take the fallback path down.
+func newFallbackHost(u *reloadableUpstream, spec string) (*UpstreamHost, error) {
+	trans, addr := SplitTransportHost(spec)
+	host := &UpstreamHost{proto: trans, addr: addr}
+	host.transport = newTransport()
+	host.transport.recursionDesired = u.transport.recursionDesired
+	host.transport.expire = u.transport.expire
+
+	if host.proto == transport.TLS {
+		rawAddr, tlsServerName := SplitByByte(host.addr, '@')
+		host.addr = rawAddr
+		host.transport.tlsConfig = new(tls.Config)
+		host.transport.tlsConfig.Certificates = u.transport.tlsConfig.Certificates
+		host.transport.tlsConfig.RootCAs = u.transport.tlsConfig.RootCAs
+		if hostPortIsIpPort(rawAddr) {
+			host.transport.tlsConfig.ServerName = u.transport.tlsConfig.ServerName
+		}
+		if tlsServerName != "" {
+			tlsServerName = tlsServerName[1:]
+			serverName, ok := stringToDomain(tlsServerName)
+			if !ok {
+				return nil, fmt.Errorf("invalid TLS server name %q", tlsServerName)
+			}
+			host.transport.tlsConfig.ServerName = serverName
+		}
+	}
+
+	network := protoToNetwork(host.proto)
+	if network == "dns" {
+		network = "udp"
+	}
+	host.c = &dns.Client{Net: network, TLSConfig: host.transport.tlsConfig, Timeout: defaultHcTimeout}
+
+	noProxy := *u
+	noProxy.proxy = nil
+	host.InitDOH(&noProxy)
+	return host, nil
+}

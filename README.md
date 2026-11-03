@@ -95,10 +95,12 @@ dnsredir FROM... {
     max_fails INTEGER
 
     to TO...
+    fallback TO...
     expire DURATION
     tls CERT KEY CA
     tls_servername NAME
     bootstrap BOOTSTRAP...
+    proxy SOCKS5_URL
     no_ipv6
 
     ipset SETNAME...
@@ -165,6 +167,19 @@ Some of the options take a `DURATION` as argument, **zero time(i.e. `0`) duratio
     Note that this is a global name, it doesn't affect the TLS server names specified in `to TO...`.
 
 * `bootstrap` specifies the bootstrap DNS servers(must be valid IP address) to resolve domain names in `to TO...`(if any).
+
+* `fallback` specifies one or more upstreams used only when every `to TO...` upstream fails (transport error, timeout, or a `SERVFAIL` answer). Fallback upstreams are always dialed directly: `proxy` does not apply to them, so resolution keeps working (possibly with polluted or leaked answers) when the proxy is down. Example: `fallback 223.5.5.5`.
+
+* `proxy` dials the upstream connections through a `SOCKS5` proxy, the URL format is `socks5://[USER:PASSWORD@]HOST:PORT`(`socks5h://` is accepted as an alias). Both the host given in `to TO...` and the DoH request are sent to the proxy, so name resolution happens on the proxy side. All upstream transports are supported: `tcp://`/`tls://`/DoH go through `CONNECT`, while `udp://`(and `dns://` when the request arrives over UDP) uses `UDP ASSOCIATE` as defined by RFC 1928. Note that the proxy must implement `UDP ASSOCIATE` for the UDP case.
+
+  Example:
+
+  ```Corefile
+  dnsredir /etc/dnsredir/foreign.lst {
+      to tls://1.1.1.1@cloudflare-dns.com
+      proxy socks5://127.0.0.1:1080
+  }
+  ```
 
 * `no_ipv6` specifies don't try to resolve `IPv6` addresses for DNS exchange in `bootstrap`, in other words, use `IPv4` only.
 
